@@ -162,13 +162,16 @@ function calculateStreaks(weeks) {
     // Stop if we've gone past today (shouldn't happen, but safety check)
     if (dayDate > today) continue;
 
+    // sourcery skip: merge-else-if
     if (day.contributionCount > 0) {
       currentStreak++;
       currentStreakStart = day.date;
-    } else if (day.date !== todayStr) {
-      // If we hit a day with no contributions and it's not today
-      // (preserve streak if user hasn't contributed yet today)
-      break;
+    } else {
+      // If we hit a day with no contributions
+      // Only break if this is not today (to preserve streak if user hasn't contributed yet today)
+      if (day.date !== todayStr) {
+        break;
+      }
     }
   }
 
@@ -287,7 +290,7 @@ function generateSVG(
   // Generate language bar
   let currentX = 0;
   const barWidth = 720;
-  const barY = 500;
+  const barY = 580;
   const barHeight = 32;
   const languageBarSegments = languages
     .map((lang, index) => {
@@ -311,7 +314,7 @@ function generateSVG(
       const row = Math.floor(index / 2);
       const col = index % 2;
       const x = col === 0 ? 100 : 450;
-      const y = 565 + row * 42;
+      const y = 645 + row * 42;
 
       return `
         <circle cx="${x - 45}" cy="${y - 4}" r="7" fill="${lang.color}"/>
@@ -379,32 +382,32 @@ function generateSVG(
   <rect x="10" y="10" width="780" height="160" fill="none" class="border" stroke-width="2" rx="10"/>
   
   <!-- Total Contributions -->
-  <g transform="translate(140, 60)">
+  <g transform="translate(140, 90)">
     <circle cx="0" cy="0" r="50" class="accent-red" opacity="0.12"/>
-    <text x="0" y="15" class="text stat-number accent-red" text-anchor="middle">${totalContributions.toLocaleString()}</text>
-    <text x="0" y="38" class="accent-red stat-label" text-anchor="middle">Total Contributions</text>
-    <text x="0" y="60" class="text stat-detail" text-anchor="middle">${accountCreated} - Present</text>
+    <text x="0" y="8" class="text stat-number accent-red" text-anchor="middle">${totalContributions.toLocaleString()}</text>
+    <text x="0" y="31" class="accent-red stat-label" text-anchor="middle">Total Contributions</text>
+    <text x="0" y="50" class="text stat-detail" text-anchor="middle">${accountCreated} - Present</text>
   </g>
   
   <!-- Current Streak -->
-  <g transform="translate(400, 60)">
+  <g transform="translate(400, 90)">
     <circle cx="0" cy="0" r="50" class="accent-blue" opacity="0.12"/>
-    <path d="M -8 -15 Q -8 -20 -3 -20 L -3 -25 Q -3 -30 -8 -30 Q -13 -30 -13 -25 L -13 -20 Q -13 -20 -8 -15 M 8 -15 Q 8 -20 3 -20 L 3 -25 Q 3 -30 8 -30 Q 13 -30 13 -25 L 13 -20 Q 13 -20 8 -15 Z" class="accent-blue" opacity="0.7"/>
-    <text x="0" y="15" class="text stat-number accent-blue" text-anchor="middle">${
+    <path d="M -8 -22 Q -8 -27 -3 -27 L -3 -32 Q -3 -37 -8 -37 Q -13 -37 -13 -32 L -13 -27 Q -13 -27 -8 -22 M 8 -22 Q 8 -27 3 -27 L 3 -32 Q 3 -37 8 -37 Q 13 -37 13 -32 L 13 -27 Q 13 -27 8 -22 Z" class="accent-blue" opacity="0.7"/>
+    <text x="0" y="8" class="text stat-number accent-blue" text-anchor="middle">${
       streaks.current
     }</text>
-    <text x="0" y="38" class="accent-blue stat-label" text-anchor="middle">Current Streak</text>
-    <text x="0" y="60" class="text stat-detail" text-anchor="middle">${currentStartDate} - Present</text>
+    <text x="0" y="31" class="accent-blue stat-label" text-anchor="middle">Current Streak</text>
+    <text x="0" y="50" class="text stat-detail" text-anchor="middle">${currentStartDate} - Present</text>
   </g>
   
   <!-- Longest Streak -->
-  <g transform="translate(660, 60)">
+  <g transform="translate(660, 90)">
     <circle cx="0" cy="0" r="50" class="accent-purple" opacity="0.12"/>
-    <text x="0" y="15" class="text stat-number accent-purple" text-anchor="middle">${
+    <text x="0" y="8" class="text stat-number accent-purple" text-anchor="middle">${
       streaks.longest
     }</text>
-    <text x="0" y="38" class="accent-purple stat-label" text-anchor="middle">Longest Streak</text>
-    <text x="0" y="60" class="text stat-detail" text-anchor="middle">${longestStartDate} - ${longestEndDate}</text>
+    <text x="0" y="31" class="accent-purple stat-label" text-anchor="middle">Longest Streak</text>
+    <text x="0" y="50" class="text stat-detail" text-anchor="middle">${longestStartDate} - ${longestEndDate}</text>
   </g>
   
   <!-- Dividers -->
@@ -419,7 +422,7 @@ function generateSVG(
   <text x="30" y="218" class="text section-title">Contribution Activity (Last 90 Days)</text>
   
   <!-- Activity Graph -->
-  <g transform="translate(30, 230)">
+  <g transform="translate(30, 240)">
     <!-- Grid lines -->
     ${gridLines.join("")}
     
@@ -445,11 +448,11 @@ function generateSVG(
   </g>
   
   <!-- Additional Stats Container -->
-  <rect x="10" y="400" width="780" height="80" class="section-bg" rx="10"/>
-  <rect x="10" y="400" width="780" height="80" fill="none" class="border" stroke-width="2" rx="10"/>
+  <rect x="10" y="400" width="780" height="90" class="section-bg" rx="10"/>
+  <rect x="10" y="400" width="780" height="90" fill="none" class="border" stroke-width="2" rx="10"/>
   
   <!-- Repository Stats -->
-  <g transform="translate(0, 440)">
+  <g transform="translate(0, 455)">
     <text x="200" y="0" class="text stat-number accent-blue" text-anchor="middle">${repoStats.totalStars.toLocaleString()}</text>
     <text x="200" y="22" class="accent-blue stat-label" text-anchor="middle">Total Stars</text>
     
@@ -462,15 +465,15 @@ function generateSVG(
     <text x="600" y="22" class="accent-green stat-label" text-anchor="middle">Languages Used</text>
   </g>
   
-  <line x1="310" y1="410" x2="310" y2="470" class="border" stroke-width="2" opacity="0.3"/>
-  <line x1="490" y1="410" x2="490" y2="470" class="border" stroke-width="2" opacity="0.3"/>
+  <line x1="310" y1="415" x2="310" y2="475" class="border" stroke-width="2" opacity="0.3"/>
+  <line x1="490" y1="415" x2="490" y2="475" class="border" stroke-width="2" opacity="0.3"/>
   
   <!-- Languages Container -->
-  <rect x="10" y="500" width="780" height="250" class="section-bg" rx="10"/>
-  <rect x="10" y="500" width="780" height="250" fill="none" class="border" stroke-width="2" rx="10"/>
+  <rect x="10" y="510" width="780" height="240" class="section-bg" rx="10"/>
+  <rect x="10" y="510" width="780" height="240" fill="none" class="border" stroke-width="2" rx="10"/>
   
   <!-- Languages Title -->
-  <text x="30" y="528" class="accent-green section-title">Most Used Languages</text>
+  <text x="30" y="538" class="accent-green section-title">Most Used Languages</text>
   
   <!-- Language Bar -->
   <g>
