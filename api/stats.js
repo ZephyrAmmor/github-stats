@@ -14,6 +14,48 @@ async function fetchGitHubData(username) {
   const userData = await userResponse.json();
   const createdAt = userData.created_at;
 
+  // Query to get user's organizations
+  const orgsQuery = `
+    query($username: String!) {
+      user(login: $username) {
+        organizations(first: 100) {
+          nodes {
+            id
+            login
+          }
+        }
+      }
+    }
+  `;
+
+  const orgsResponse = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ query: orgsQuery, variables: { username } }),
+  });
+
+  const orgsData = await orgsResponse.json();
+  if (orgsData.errors) {
+    throw new Error(orgsData.errors[0].message);
+  }
+
+  const organizations = orgsData.data.user.organizations.nodes;
+
+  // Build query for user contributions + all org contributions
+  const contributionFragments = organizations.map((org, index) => `
+    org${index}: contributionsCollection(organizationID: "${org.id}") {
+      contributionCalendar {
+        totalContributions
+        weeks {
+          contributionDays {
+            contributionCount
+            date
+          }
+        }
+      }
+    }
+  `).join('\n');
+
   const query = `
     query($username: String!) {
       user(login: $username) {
@@ -28,6 +70,7 @@ async function fetchGitHubData(username) {
             }
           }
         }
+        ${contributionFragments}
         repositories(first: 100, ownerAffiliations: OWNER, orderBy: {field: UPDATED_AT, direction: DESC}) {
           nodes {
             stargazerCount
@@ -63,10 +106,72 @@ async function fetchGitHubData(username) {
     throw new Error(data.errors[0].message);
   }
 
+  // Merge all contributions (user + all orgs)
+  const allContributions = [data.data.user.contributionsCollection];
+  
+  // Add org contributions
+  organizations.forEach((org, index) => {
+    const orgContributions = data.data.user[`org${index}`];
+    if (orgContributions) {
+      allContributions.push(orgContributions);
+    }
+  });
+
+  const mergedCalendar = mergeContributions(allContributions);
+
   return {
-    calendar: data.data.user.contributionsCollection.contributionCalendar,
+    calendar: mergedCalendar,
     repositories: data.data.user.repositories.nodes,
     createdAt: createdAt,
+  };
+}
+
+function mergeContributions(contributionCollections) {
+  // Create a map to deduplicate and sum contributions by date
+  const contributionMap = new Map();
+  let totalContributions = 0;
+
+  contributionCollections.forEach(collection => {
+    collection.contributionCalendar.weeks.forEach(week => {
+      week.contributionDays.forEach(day => {
+        const existing = contributionMap.get(day.date) || 0;
+        contributionMap.set(day.date, existing + day.contributionCount);
+      });
+    });
+  });
+
+  // Convert map back to weeks structure
+  const sortedDates = Array.from(contributionMap.keys()).sort();
+  const weeks = [];
+  let currentWeek = [];
+  
+  sortedDates.forEach((date, index) => {
+    const dayOfWeek = new Date(date + 'T00:00:00Z').getUTCDay();
+    
+    // Start a new week on Sunday (day 0) or if it's the first date
+    if (index === 0 || dayOfWeek === 0) {
+      if (currentWeek.length > 0) {
+        weeks.push({ contributionDays: currentWeek });
+      }
+      currentWeek = [];
+    }
+    
+    const count = contributionMap.get(date);
+    currentWeek.push({
+      contributionCount: count,
+      date: date
+    });
+    totalContributions += count;
+  });
+  
+  // Add the last week
+  if (currentWeek.length > 0) {
+    weeks.push({ contributionDays: currentWeek });
+  }
+
+  return {
+    totalContributions,
+    weeks
   };
 }
 
