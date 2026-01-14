@@ -7,13 +7,41 @@ async function fetchGitHubData(username) {
     "Content-Type": "application/json",
   };
 
-  // First get user creation date
-  const userResponse = await fetch(`https://api.github.com/users/${username}`, {
-    headers,
-  });
-  const userData = await userResponse.json();
-  const createdAt = userData.created_at;
+  try {
+    // First get user creation date
+    const userResponse = await fetch(`https://api.github.com/users/${username}`, {
+      headers,
+    });
+    
+    if (!userResponse.ok) {
+      throw new Error(`User API returned ${userResponse.status}`);
+    }
+    
+    const userData = await userResponse.json();
+    
+    if (!userData.created_at) {
+      throw new Error(`User ${username} not found`);
+    }
+    
+    const createdAt = userData.created_at;
 
+    // Try to fetch with organization contributions
+    try {
+      return await fetchWithOrgContributions(username, headers, createdAt);
+    } catch (orgError) {
+      console.error("Failed to fetch org contributions:", orgError.message);
+      console.log("Falling back to user-only contributions");
+      
+      // Fallback to user-only contributions
+      return await fetchUserOnlyContributions(username, headers, createdAt);
+    }
+  } catch (error) {
+    console.error("Fatal error in fetchGitHubData:", error);
+    throw error;
+  }
+}
+
+async function fetchWithOrgContributions(username, headers, createdAt) {
   // Query to get user's organizations
   const orgsQuery = `
     query($username: String!) {
@@ -34,12 +62,22 @@ async function fetchGitHubData(username) {
     body: JSON.stringify({ query: orgsQuery, variables: { username } }),
   });
 
-  const orgsData = await orgsResponse.json();
-  if (orgsData.errors) {
-    throw new Error(orgsData.errors[0].message);
+  if (!orgsResponse.ok) {
+    throw new Error(`Orgs GraphQL API error: ${orgsResponse.status}`);
   }
 
-  const organizations = orgsData.data.user.organizations.nodes;
+  const orgsData = await orgsResponse.json();
+  
+  if (orgsData.errors) {
+    throw new Error(`GraphQL error: ${orgsData.errors[0].message}`);
+  }
+
+  if (!orgsData.data || !orgsData.data.user) {
+    throw new Error(`User ${username} not found in GraphQL`);
+  }
+
+  const organizations = orgsData.data.user.organizations.nodes || [];
+  console.log(`Found ${organizations.length} organizations for ${username}`);
 
   // Build query for user contributions + all org contributions
   const contributionFragments = organizations.map((org, index) => `
@@ -97,13 +135,17 @@ async function fetchGitHubData(username) {
   });
 
   if (!response.ok) {
-    throw new Error("Failed to fetch GitHub data");
+    throw new Error(`Main GraphQL API error: ${response.status}`);
   }
 
   const data = await response.json();
 
   if (data.errors) {
-    throw new Error(data.errors[0].message);
+    throw new Error(`GraphQL error: ${data.errors[0].message}`);
+  }
+
+  if (!data.data || !data.data.user) {
+    throw new Error(`User ${username} not found`);
   }
 
   // Merge all contributions (user + all orgs)
@@ -112,8 +154,9 @@ async function fetchGitHubData(username) {
   // Add org contributions
   organizations.forEach((org, index) => {
     const orgContributions = data.data.user[`org${index}`];
-    if (orgContributions) {
+    if (orgContributions && orgContributions.contributionCalendar) {
       allContributions.push(orgContributions);
+      console.log(`Added contributions from org: ${org.login}`);
     }
   });
 
@@ -126,13 +169,80 @@ async function fetchGitHubData(username) {
   };
 }
 
+async function fetchUserOnlyContributions(username, headers, createdAt) {
+  const query = `
+    query($username: String!) {
+      user(login: $username) {
+        contributionsCollection {
+          contributionCalendar {
+            totalContributions
+            weeks {
+              contributionDays {
+                contributionCount
+                date
+              }
+            }
+          }
+        }
+        repositories(first: 100, ownerAffiliations: OWNER, orderBy: {field: UPDATED_AT, direction: DESC}) {
+          nodes {
+            stargazerCount
+            forkCount
+            languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+              edges {
+                size
+                node {
+                  name
+                  color
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const response = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ query, variables: { username } }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`GraphQL API returned ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  if (data.errors) {
+    throw new Error(data.errors[0].message);
+  }
+
+  if (!data.data || !data.data.user) {
+    throw new Error(`User ${username} not found`);
+  }
+
+  return {
+    calendar: data.data.user.contributionsCollection.contributionCalendar,
+    repositories: data.data.user.repositories.nodes,
+    createdAt: createdAt,
+  };
+}
+
 function mergeContributions(contributionCollections) {
   // Create a map to deduplicate and sum contributions by date
   const contributionMap = new Map();
   let totalContributions = 0;
 
   contributionCollections.forEach(collection => {
+    if (!collection || !collection.contributionCalendar) {
+      return;
+    }
+    
     collection.contributionCalendar.weeks.forEach(week => {
+      if (!week.contributionDays) return;
+      
       week.contributionDays.forEach(day => {
         const existing = contributionMap.get(day.date) || 0;
         contributionMap.set(day.date, existing + day.contributionCount);
@@ -142,17 +252,23 @@ function mergeContributions(contributionCollections) {
 
   // Convert map back to weeks structure
   const sortedDates = Array.from(contributionMap.keys()).sort();
+  
+  if (sortedDates.length === 0) {
+    return {
+      totalContributions: 0,
+      weeks: []
+    };
+  }
+  
   const weeks = [];
   let currentWeek = [];
   
   sortedDates.forEach((date, index) => {
     const dayOfWeek = new Date(date + 'T00:00:00Z').getUTCDay();
     
-    // Start a new week on Sunday (day 0) or if it's the first date
-    if (index === 0 || dayOfWeek === 0) {
-      if (currentWeek.length > 0) {
-        weeks.push({ contributionDays: currentWeek });
-      }
+    // Start a new week on Sunday (day 0)
+    if (dayOfWeek === 0 && currentWeek.length > 0) {
+      weeks.push({ contributionDays: currentWeek });
       currentWeek = [];
     }
     
@@ -195,6 +311,10 @@ function calculateLanguageStats(repositories) {
     (sum, lang) => sum + lang.size,
     0
   );
+
+  if (totalSize === 0) {
+    return [];
+  }
 
   return Object.entries(languageMap)
     .map(([name, data]) => ({
@@ -622,6 +742,7 @@ module.exports = async (req, res) => {
     res.status(200).send(svg);
   } catch (error) {
     console.error("Error generating stats:", error.message);
+    console.error("Stack trace:", error.stack);
     res.status(500).send(`Error: ${error.message}`);
   }
 };
