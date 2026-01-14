@@ -109,7 +109,7 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
           }
         }
         ${contributionFragments}
-        repositories(first: 100, ownerAffiliations: OWNER, orderBy: {field: UPDATED_AT, direction: DESC}) {
+        repositories(first: 100, ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], orderBy: {field: UPDATED_AT, direction: DESC}) {
           nodes {
             stargazerCount
             forkCount
@@ -162,6 +162,9 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
 
   const mergedCalendar = mergeContributions(allContributions);
 
+  console.log(`Total contributions after merge: ${mergedCalendar.totalContributions}`);
+  console.log(`User-only contributions: ${data.data.user.contributionsCollection.contributionCalendar.totalContributions}`);
+
   return {
     calendar: mergedCalendar,
     repositories: data.data.user.repositories.nodes,
@@ -184,7 +187,7 @@ async function fetchUserOnlyContributions(username, headers, createdAt) {
             }
           }
         }
-        repositories(first: 100, ownerAffiliations: OWNER, orderBy: {field: UPDATED_AT, direction: DESC}) {
+        repositories(first: 100, ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], orderBy: {field: UPDATED_AT, direction: DESC}) {
           nodes {
             stargazerCount
             forkCount
@@ -723,8 +726,18 @@ module.exports = async (req, res) => {
     const { calendar, repositories, createdAt } = await fetchGitHubData(
       username
     );
+    
+    console.log(`=== Final Stats for ${username} ===`);
+    console.log(`Total contributions in calendar: ${calendar.totalContributions}`);
+    console.log(`Total weeks: ${calendar.weeks.length}`);
+    console.log(`Total repositories: ${repositories.length}`);
+    
     const streaks = calculateStreaks(calendar.weeks);
     const activityDays = getLast90Days(calendar.weeks);
+    
+    console.log(`Activity days (last 90): ${activityDays.length}`);
+    console.log(`Current streak: ${streaks.current}, Longest streak: ${streaks.longest}`);
+    
     const languages = calculateLanguageStats(repositories);
     const repoStats = calculateRepoStats(repositories);
 
