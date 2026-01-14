@@ -2,7 +2,7 @@
 
 A serverless GitHub statistics dashboard that displays your contribution metrics and activity graph.
 
-![Github-stats](https://github-stats-neon-nu.vercel.app/api/stats?username=Exc1D)
+![Github-stats](https://gh-stats-kohl.vercel.app/api/stats?username=ZephyrAmmor)
 
 ## Features
 
