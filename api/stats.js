@@ -94,10 +94,10 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
     }
   `).join('\n');
 
-  const query = `
-    query($username: String!) {
-      user(login: $username) {
-        contributionsCollection {
+  const contributionsField = (includePrivate) => `
+        contributionsCollection${
+          includePrivate ? "(includePrivateContributions: true)" : ""
+        } {
           contributionCalendar {
             totalContributions
             weeks {
@@ -107,7 +107,12 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
               }
             }
           }
-        }
+        }`;
+
+  const buildQuery = (includePrivate) => `
+    query($username: String!) {
+      user(login: $username) {
+        ${contributionsField(includePrivate)}
         ${contributionFragments}
         repositories(first: 100, ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], orderBy: {field: UPDATED_AT, direction: DESC}) {
           nodes {
@@ -127,18 +132,34 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
       }
     }
   `;
+  const fetchUserData = async (includePrivate) => {
+    const response = await fetch("https://api.github.com/graphql", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query: buildQuery(includePrivate), variables: { username } }),
+    });
 
-  const response = await fetch("https://api.github.com/graphql", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ query, variables: { username } }),
-  });
+    if (!response.ok) {
+      throw new Error(`Main GraphQL API error: ${response.status}`);
+    }
 
-  if (!response.ok) {
-    throw new Error(`Main GraphQL API error: ${response.status}`);
+    return response.json();
+  };
+
+  const isIncludePrivateArgError = (errors) =>
+    Array.isArray(errors) &&
+    errors.some(
+      (error) =>
+        typeof error.message === "string" &&
+        error.message.includes("includePrivateContributions") &&
+        error.message.includes("doesn't accept argument")
+    );
+
+  let data = await fetchUserData(true);
+
+  if (data.errors && isIncludePrivateArgError(data.errors)) {
+    data = await fetchUserData(false);
   }
-
-  const data = await response.json();
 
   if (data.errors) {
     throw new Error(`GraphQL error: ${data.errors[0].message}`);
@@ -148,35 +169,21 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
     throw new Error(`User ${username} not found`);
   }
 
-  // Merge all contributions (user + all orgs)
-  const allContributions = [data.data.user.contributionsCollection];
-  
-  // Add org contributions
-  organizations.forEach((org, index) => {
-    const orgContributions = data.data.user[`org${index}`];
-    if (orgContributions && orgContributions.contributionCalendar) {
-      allContributions.push(orgContributions);
-      console.log(`Added contributions from org: ${org.login}`);
-    }
-  });
-
-  const mergedCalendar = mergeContributions(allContributions);
-
-  console.log(`Total contributions after merge: ${mergedCalendar.totalContributions}`);
-  console.log(`User-only contributions: ${data.data.user.contributionsCollection.contributionCalendar.totalContributions}`);
+  // NOTE: contributionsCollection without organizationID already includes org activity.
+  // Merging org-specific calendars will double count, so we return the user's calendar as-is.
 
   return {
-    calendar: mergedCalendar,
+    calendar: data.data.user.contributionsCollection.contributionCalendar,
     repositories: data.data.user.repositories.nodes,
     createdAt: createdAt,
   };
 }
 
 async function fetchUserOnlyContributions(username, headers, createdAt) {
-  const query = `
-    query($username: String!) {
-      user(login: $username) {
-        contributionsCollection {
+  const contributionsField = (includePrivate) => `
+        contributionsCollection${
+          includePrivate ? "(includePrivateContributions: true)" : ""
+        } {
           contributionCalendar {
             totalContributions
             weeks {
@@ -186,7 +193,12 @@ async function fetchUserOnlyContributions(username, headers, createdAt) {
               }
             }
           }
-        }
+        }`;
+
+  const buildQuery = (includePrivate) => `
+    query($username: String!) {
+      user(login: $username) {
+        ${contributionsField(includePrivate)}
         repositories(first: 100, ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], orderBy: {field: UPDATED_AT, direction: DESC}) {
           nodes {
             stargazerCount
@@ -205,18 +217,34 @@ async function fetchUserOnlyContributions(username, headers, createdAt) {
       }
     }
   `;
+  const fetchUserData = async (includePrivate) => {
+    const response = await fetch("https://api.github.com/graphql", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query: buildQuery(includePrivate), variables: { username } }),
+    });
 
-  const response = await fetch("https://api.github.com/graphql", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ query, variables: { username } }),
-  });
+    if (!response.ok) {
+      throw new Error(`GraphQL API returned ${response.status}`);
+    }
 
-  if (!response.ok) {
-    throw new Error(`GraphQL API returned ${response.status}`);
+    return response.json();
+  };
+
+  const isIncludePrivateArgError = (errors) =>
+    Array.isArray(errors) &&
+    errors.some(
+      (error) =>
+        typeof error.message === "string" &&
+        error.message.includes("includePrivateContributions") &&
+        error.message.includes("doesn't accept argument")
+    );
+
+  let data = await fetchUserData(true);
+
+  if (data.errors && isIncludePrivateArgError(data.errors)) {
+    data = await fetchUserData(false);
   }
-
-  const data = await response.json();
 
   if (data.errors) {
     throw new Error(data.errors[0].message);
