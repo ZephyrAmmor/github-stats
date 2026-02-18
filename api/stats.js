@@ -1,9 +1,9 @@
 const fetch = require("node-fetch");
 
-async function fetchGitHubData(username) {
+async function fetchGitHubData(username, orgLogins) {
   const token = process.env.GITHUB_TOKEN || "";
   const headers = {
-    Authorization: token ? `token ${token}` : "",
+    Authorization: token ? `Bearer ${token}` : "",
     "Content-Type": "application/json",
   };
 
@@ -27,7 +27,7 @@ async function fetchGitHubData(username) {
 
     // Try to fetch with organization contributions
     try {
-      return await fetchWithOrgContributions(username, headers, createdAt);
+      return await fetchWithOrgContributions(username, headers, createdAt, orgLogins);
     } catch (orgError) {
       console.error("Failed to fetch org contributions:", orgError.message);
       console.log("Falling back to user-only contributions");
@@ -41,7 +41,51 @@ async function fetchGitHubData(username) {
   }
 }
 
-async function fetchWithOrgContributions(username, headers, createdAt) {
+async function fetchOrganizationsByLogin(orgLogins, headers) {
+  const cleanLogins = orgLogins
+    .map((login) => String(login).trim())
+    .filter((login) => /^[A-Za-z0-9-]+$/.test(login));
+
+  if (cleanLogins.length === 0) {
+    return [];
+  }
+
+  const orgsQuery = `
+    query {
+      ${cleanLogins
+        .map(
+          (login, index) => `
+        org${index}: organization(login: "${login}") {
+          id
+          login
+          avatarUrl
+        }
+      `
+        )
+        .join("\n")}
+    }
+  `;
+
+  const response = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ query: orgsQuery }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Org lookup GraphQL API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (data.errors) {
+    console.error("Org lookup GraphQL errors:", data.errors.map((e) => e.message));
+  }
+
+  const orgs = Object.values(data.data || {}).filter(Boolean);
+  return orgs;
+}
+
+async function fetchWithOrgContributions(username, headers, createdAt, orgLogins) {
   // Query to get user's organizations
   const orgsQuery = `
     query($username: String!) {
@@ -50,6 +94,17 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
           nodes {
             id
             login
+            avatarUrl
+          }
+        }
+      }
+      viewer {
+        login
+        organizations(first: 100) {
+          nodes {
+            id
+            login
+            avatarUrl
           }
         }
       }
@@ -76,23 +131,41 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
     throw new Error(`User ${username} not found in GraphQL`);
   }
 
-  const organizations = orgsData.data.user.organizations.nodes || [];
-  console.log(`Found ${organizations.length} organizations for ${username}`);
+  const userOrgs = orgsData.data.user.organizations.nodes || [];
+  const viewerLogin = orgsData.data.viewer?.login;
+  const viewerOrgs = orgsData.data.viewer?.organizations?.nodes || [];
+  let organizations =
+    userOrgs.length > 0
+      ? userOrgs
+      : viewerLogin && viewerLogin.toLowerCase() === username.toLowerCase()
+      ? viewerOrgs
+      : [];
+
+  if (Array.isArray(orgLogins) && orgLogins.length > 0) {
+    const forcedOrgs = await fetchOrganizationsByLogin(orgLogins, headers);
+    if (forcedOrgs.length > 0) {
+      organizations = forcedOrgs;
+    }
+  }
+  console.log(
+    `Found ${organizations.length} organizations for ${username} (user=${userOrgs.length}, viewer=${viewerOrgs.length}, viewerLogin=${viewerLogin})`
+  );
 
   // Build query for user contributions + all org contributions
-  const contributionFragments = organizations.map((org, index) => `
-    org${index}: contributionsCollection(organizationID: "${org.id}") {
+  const contributionFragments = (includePrivate) =>
+    organizations
+      .map(
+        (org, index) => `
+    org${index}: contributionsCollection(organizationID: "${org.id}"${
+          includePrivate ? ", includePrivateContributions: true" : ""
+        }) {
       contributionCalendar {
         totalContributions
-        weeks {
-          contributionDays {
-            contributionCount
-            date
-          }
-        }
       }
     }
-  `).join('\n');
+  `
+      )
+      .join("\n");
 
   const contributionsField = (includePrivate) => `
         contributionsCollection${
@@ -113,11 +186,12 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
     query($username: String!) {
       user(login: $username) {
         ${contributionsField(includePrivate)}
-        ${contributionFragments}
+        ${contributionFragments(includePrivate)}
         repositories(first: 100, ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], orderBy: {field: UPDATED_AT, direction: DESC}) {
           nodes {
             stargazerCount
             forkCount
+            isFork
             languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
               edges {
                 size
@@ -172,10 +246,21 @@ async function fetchWithOrgContributions(username, headers, createdAt) {
   // NOTE: contributionsCollection without organizationID already includes org activity.
   // Merging org-specific calendars will double count, so we return the user's calendar as-is.
 
+  const organizationsWithContributions = organizations.map((org, index) => {
+    const aliasKey = `org${index}`;
+    const orgData = data.data.user[aliasKey];
+    return {
+      login: org.login,
+      avatarUrl: org.avatarUrl,
+      contributions: orgData?.contributionCalendar?.totalContributions ?? 0,
+    };
+  });
+
   return {
     calendar: data.data.user.contributionsCollection.contributionCalendar,
     repositories: data.data.user.repositories.nodes,
     createdAt: createdAt,
+    organizations: organizationsWithContributions,
   };
 }
 
@@ -203,6 +288,7 @@ async function fetchUserOnlyContributions(username, headers, createdAt) {
           nodes {
             stargazerCount
             forkCount
+            isFork
             languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
               edges {
                 size
@@ -258,6 +344,7 @@ async function fetchUserOnlyContributions(username, headers, createdAt) {
     calendar: data.data.user.contributionsCollection.contributionCalendar,
     repositories: data.data.user.repositories.nodes,
     createdAt: createdAt,
+    organizations: [],
   };
 }
 
@@ -325,7 +412,7 @@ function mergeContributions(contributionCollections) {
 function calculateLanguageStats(repositories) {
   const languageMap = {};
 
-  repositories.forEach((repo) => {
+  repositories.filter((repo) => !repo.isFork).forEach((repo) => {
     repo.languages.edges.forEach((edge) => {
       const { name, color } = edge.node;
       const { size } = edge;
@@ -355,7 +442,7 @@ function calculateLanguageStats(repositories) {
       size: data.size,
     }))
     .sort((a, b) => b.size - a.size)
-    .slice(0, 5);
+    .slice(0, 6);
 }
 
 function calculateStreaks(weeks) {
@@ -439,9 +526,9 @@ function calculateStreaks(weeks) {
   };
 }
 
-function getLast90Days(weeks) {
+function getLast100Days(weeks) {
   const allDays = weeks.flatMap((week) => week.contributionDays);
-  return allDays.slice(-90);
+  return allDays.slice(-100);
 }
 
 function formatDate(dateStr) {
@@ -454,6 +541,31 @@ function formatDate(dateStr) {
   });
 }
 
+function formatShortDate(dateStr) {
+  const date = new Date(dateStr + "T00:00:00Z");
+  return date.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+function getContrastColor(hexColor) {
+  const hex = hexColor.replace("#", "");
+  if (hex.length !== 6) return "#ffffff";
+  const r = parseInt(hex.slice(0, 2), 16);
+  const g = parseInt(hex.slice(2, 4), 16);
+  const b = parseInt(hex.slice(4, 6), 16);
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? "#000000" : "#ffffff";
+}
+
+function buildShieldUrl(label, colorHex) {
+  const cleanColor = colorHex.replace("#", "");
+  const encodedLabel = encodeURIComponent(label).replace(/%20/g, "_");
+  return `https://img.shields.io/badge/${encodedLabel}-${cleanColor}?style=for-the-badge`;
+}
+
 function getAccountCreationDate(createdAt) {
   const date = new Date(createdAt);
   return date.toLocaleDateString("en-US", {
@@ -464,11 +576,12 @@ function getAccountCreationDate(createdAt) {
 }
 
 function calculateRepoStats(repositories) {
-  const totalStars = repositories.reduce(
+  const sourceRepos = repositories.filter((repo) => !repo.isFork);
+  const totalStars = sourceRepos.reduce(
     (sum, repo) => sum + repo.stargazerCount,
     0
   );
-  const totalForks = repositories.reduce(
+  const totalForks = sourceRepos.reduce(
     (sum, repo) => sum + repo.forkCount,
     0
   );
@@ -481,10 +594,11 @@ function generateSVG(
   activityDays,
   languages,
   createdAt,
-  repoStats
+  repoStats,
+  organizations
 ) {
   const width = 800;
-  const height = 760;
+  const height = 950;
   const graphWidth = 720;
   const graphHeight = 140;
   const padding = 30;
@@ -499,10 +613,12 @@ function generateSVG(
     const x =
       padding +
       (index / (activityDays.length - 1)) * (graphWidth - 2 * padding);
-    const y =
-      graphHeight -
-      padding -
-      (day.contributionCount / maxContributions) * (graphHeight - 2 * padding);
+    const axisY = graphHeight - padding;
+    const usableHeight = graphHeight - 2 * padding;
+    const yRaw =
+      axisY -
+      (day.contributionCount / maxContributions) * usableHeight;
+    const y = Math.min(axisY, yRaw);
     return { x, y, count: day.contributionCount };
   });
 
@@ -512,7 +628,9 @@ function generateSVG(
     const prev = points[i - 1];
     const curr = points[i];
     const midX = (prev.x + curr.x) / 2;
-    linePath += ` Q ${prev.x},${prev.y} ${midX},${(prev.y + curr.y) / 2}`;
+    const axisY = graphHeight - padding;
+    const midY = Math.min(axisY, (prev.y + curr.y) / 2);
+    linePath += ` Q ${prev.x},${prev.y} ${midX},${midY}`;
     if (i === points.length - 1) {
       linePath += ` Q ${curr.x},${curr.y} ${curr.x},${curr.y}`;
     }
@@ -521,6 +639,20 @@ function generateSVG(
   const areaPath = `${linePath} L ${graphWidth - padding},${
     graphHeight - padding
   } L ${padding},${graphHeight - padding} Z`;
+
+  const sundayLabels = activityDays
+    .map((day, index) => {
+      const dayOfWeek = new Date(day.date + "T00:00:00Z").getUTCDay();
+      if (dayOfWeek !== 0) return "";
+      const x =
+        padding +
+        (index / (activityDays.length - 1)) * (graphWidth - 2 * padding);
+      return `<text x="${x}" y="${graphHeight - padding + 16}" class="axis-label" text-anchor="middle">${formatShortDate(
+        day.date
+      )}</text>`;
+    })
+    .filter(Boolean)
+    .join("");
 
   // Generate grid lines
   const gridLines = [];
@@ -544,44 +676,96 @@ function generateSVG(
 
   // Generate language bar
   let currentX = 0;
-  const barWidth = 720;
-  const barY = 580;
-  const barHeight = 32;
-  const languageBarSegments = languages
-    .map((lang, index) => {
-      const segmentWidth = (parseFloat(lang.percentage) / 100) * barWidth;
-      const isFirst = index === 0;
-      const isLast = index === languages.length - 1;
-      const rx = isFirst || isLast ? 6 : 0;
-      const segment = `<rect x="${
-        currentX + 40
-      }" y="${barY}" width="${segmentWidth}" height="${barHeight}" fill="${
-        lang.color
-      }" rx="${rx}"/>`;
-      currentX += segmentWidth;
-      return segment;
-    })
-    .join("");
+  const pieCenterX = 180;
+  const pieCenterY = 838;
+  const pieRadius = 86;
+  const pieCircumference = 2 * Math.PI * pieRadius;
+  const totalPercentage = languages.reduce(
+    (sum, lang) => sum + parseFloat(lang.percentage),
+    0
+  );
+  const pieSegments = [
+    ...languages.map((lang) => ({
+      color: lang.color,
+      percentage: parseFloat(lang.percentage),
+    })),
+  ];
 
-  // Generate language list with improved layout
-  const languageList = languages
-    .map((lang, index) => {
-      const row = Math.floor(index / 2);
-      const col = index % 2;
-      const x = col === 0 ? 100 : 450;
-      const y = 645 + row * 42;
+  if (totalPercentage < 100) {
+    pieSegments.push({
+      color: "#8b949e",
+      percentage: 100 - totalPercentage,
+    });
+  }
+
+  let cumulativeAngle = -Math.PI / 2;
+  const pieChart = pieSegments
+    .map((segment, index) => {
+      const angle = (segment.percentage / 100) * Math.PI * 2;
+      const startAngle = cumulativeAngle;
+      const endAngle = cumulativeAngle + angle;
+      cumulativeAngle = endAngle;
+
+      const x1 = pieCenterX + pieRadius * Math.cos(startAngle);
+      const y1 = pieCenterY + pieRadius * Math.sin(startAngle);
+      const x2 = pieCenterX + pieRadius * Math.cos(endAngle);
+      const y2 = pieCenterY + pieRadius * Math.sin(endAngle);
+      const largeArc = angle > Math.PI ? 1 : 0;
 
       return `
-        <circle cx="${x - 45}" cy="${y - 4}" r="7" fill="${lang.color}"/>
-        <text x="${x}" y="${y}" class="text lang-text">${lang.name}</text>
-        <text x="${
-          x + 230
-        }" y="${y}" class="text lang-percentage" text-anchor="end">${
-        lang.percentage
-      }%</text>
+        <path d="M ${pieCenterX} ${pieCenterY} L ${x1} ${y1} A ${pieRadius} ${pieRadius} 0 ${largeArc} 1 ${x2} ${y2} Z" fill="${segment.color}" opacity="0">
+          <animate attributeName="opacity" from="0" to="1" dur="0.8s" begin="${
+            index * 0.15
+          }s" fill="freeze"/>
+        </path>
       `;
     })
     .join("");
+
+  // Generate language list with external shield badges
+  const languageBadges = languages
+    .map((lang, index) => {
+      const row = Math.floor(index / 2);
+      const col = index % 2;
+      const x = col === 0 ? 300 : 540;
+      const y = 770 + row * 46;
+      const badgeHeight = 28;
+      const label = `${lang.name}-${lang.percentage}%`;
+      const badgeWidth = Math.max(150, label.length * 7);
+      const badgeUrl = buildShieldUrl(label, lang.color);
+
+      return `
+        <image href="${badgeUrl}" x="${x}" y="${y}" width="${badgeWidth}" height="${badgeHeight}" />
+      `;
+    })
+    .join("");
+
+  const orgs = (organizations || [])
+    .slice()
+    .sort((a, b) => b.contributions - a.contributions)
+    .slice(0, 4);
+
+  const orgCards = orgs
+    .map((org, index) => {
+      const col = index % 2;
+      const row = Math.floor(index / 2);
+      const x = col === 0 ? 60 : 420;
+      const y = 470 + row * 68;
+      const clipId = `orgClip${index}`;
+      return `
+        <clipPath id="${clipId}">
+          <circle cx="${x + 18}" cy="${y - 10}" r="18"/>
+        </clipPath>
+        <image href="${org.avatarUrl}" x="${x}" y="${y - 28}" width="36" height="36" clip-path="url(#${clipId})"/>
+        <text x="${x + 50}" y="${y - 6}" class="text stat-label">${org.login}</text>
+        <text x="${x + 50}" y="${y + 14}" class="text stat-detail">${org.contributions.toLocaleString()} contributions</text>
+      `;
+    })
+    .join("");
+
+  const orgEmptyState = `
+    <text x="60" y="515" class="text stat-detail">No organization data available</text>
+  `;
 
   return `
 <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
@@ -593,52 +777,115 @@ function generateSVG(
       .grid-line { stroke: #21262d; }
       .axis-label { fill: #7d8590; }
       .section-bg { fill: #161b22; }
+      .section-bg-strong { fill: #161b22; }
+      .accent-red { fill: #f85149; }
+      .accent-blue { fill: #58a6ff; }
+      .accent-green { fill: #3fb950; }
+      .accent-purple { fill: #a371f7; }
     }
     @media (prefers-color-scheme: light) {
       .bg { fill: #ffffff; }
-      .text { fill: #24292f; }
+      .text { fill: #1f2328; }
       .border { stroke: #d0d7de; }
       .grid-line { stroke: #e6e9ed; }
       .axis-label { fill: #57606a; }
       .section-bg { fill: #f6f8fa; }
+      .section-bg-strong { fill: #f6f8fa; }
+      .accent-red { fill: #f85149; }
+      .accent-blue { fill: #58a6ff; }
+      .accent-green { fill: #3fb950; }
+      .accent-purple { fill: #a371f7; }
     }
-    .stat-number { font-size: 52px; font-weight: bold; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .stat-number { font-size: 52px; font-weight: 700; font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif; }
     .stat-label { font-size: 15px; font-weight: 600; letter-spacing: 0.3px; }
     .stat-detail { font-size: 12px; opacity: 0.75; }
     .lang-text { font-size: 15px; font-weight: 500; }
     .lang-percentage { font-size: 16px; font-weight: 600; opacity: 0.8; }
     .section-title { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
-    .accent-red { fill: #f85149; }
-    .accent-blue { fill: #58a6ff; }
-    .accent-green { fill: #3fb950; }
-    .accent-purple { fill: #a371f7; }
-    .graph-line { stroke: #3fb950; stroke-width: 3; fill: none; stroke-linecap: round; stroke-linejoin: round; }
-    .graph-area { fill: url(#gradient); opacity: 0.3; }
+    .graph-line { stroke: #3fb950; stroke-width: 3; fill: none; stroke-linecap: round; stroke-linejoin: round; filter: url(#glow); }
+    .graph-area { fill: url(#gradient); opacity: 0.28; }
     .grid-line { stroke-width: 1; opacity: 0.3; }
     .axis-label { font-size: 11px; font-weight: 500; }
-    .text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .text { font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif; }
+    .soft-shadow { filter: url(#softShadow); }
+    .soft-ring { filter: url(#ringGlow); }
+    .stat-bubble { animation: float 6s ease-in-out infinite; transform-origin: center; }
+    .stat-bubble:nth-of-type(2) { animation-delay: 0.8s; }
+    .stat-bubble:nth-of-type(3) { animation-delay: 1.6s; }
+    .graph-line { stroke-dasharray: 100; stroke-dashoffset: 100; animation: draw 2.2s ease-out forwards; }
+    .graph-area { animation: areaPulse 6s ease-in-out infinite; }
+    .bg-sheen { animation: sheen 10s ease-in-out infinite; }
+    .section-sheen { animation: sheen 8s ease-in-out infinite; opacity: 0.18; }
+    .lang-percentage { animation: softBlink 5s ease-in-out infinite; }
+
+    @keyframes draw {
+      to { stroke-dashoffset: 0; }
+    }
+    @keyframes areaPulse {
+      0%, 100% { opacity: 0.24; }
+      50% { opacity: 0.36; }
+    }
+    @keyframes float {
+      0%, 100% { transform: translateY(0px) scale(1); }
+      50% { transform: translateY(-3px) scale(1.02); }
+    }
+    @keyframes sheen {
+      0% { transform: translateX(-20px); opacity: 0.12; }
+      50% { transform: translateX(20px); opacity: 0.22; }
+      100% { transform: translateX(-20px); opacity: 0.12; }
+    }
+    @keyframes softBlink {
+      0%, 100% { opacity: 0.7; }
+      50% { opacity: 0.95; }
+    }
   </style>
   
   <defs>
     <linearGradient id="gradient" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" style="stop-color:#3fb950;stop-opacity:0.8" />
-      <stop offset="100%" style="stop-color:#3fb950;stop-opacity:0.1" />
+      <stop offset="0%" stop-color="#3fb950" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#3fb950" stop-opacity="0.1"/>
     </linearGradient>
-    <filter id="shadow">
-      <feDropShadow dx="0" dy="1" stdDeviation="3" flood-opacity="0.15"/>
+    <radialGradient id="spotlight" cx="30%" cy="0%" r="70%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softShadow">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6" result="blur"/>
+      <feOffset dy="6" result="offset"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0   0 0 0 0 0   0 0 0 0 0   0 0 0 0.18 0" result="shadow"/>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="ringGlow">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
     </filter>
   </defs>
   
   <!-- Background -->
-  <rect width="${width}" height="${height}" class="bg" rx="12"/>
+  <rect width="${width}" height="${height}" class="bg" rx="16"/>
+  <rect width="${width}" height="${height}" fill="url(#spotlight)" rx="16" class="bg-sheen"/>
   
   <!-- Stats Container -->
-  <rect x="10" y="10" width="780" height="160" class="section-bg" rx="10"/>
-  <rect x="10" y="10" width="780" height="160" fill="none" class="border" stroke-width="2" rx="10"/>
+  <rect x="10" y="10" width="780" height="160" class="section-bg soft-shadow" rx="14"/>
+  <rect x="10" y="10" width="780" height="160" fill="none" class="border" stroke-width="1.5" rx="14"/>
+  <rect x="18" y="18" width="764" height="144" fill="url(#spotlight)" rx="12" class="section-sheen"/>
   
   <!-- Total Contributions -->
   <g transform="translate(140, 90)">
-    <circle cx="0" cy="0" r="50" class="accent-red" opacity="0.12"/>
+    <circle cx="0" cy="0" r="52" class="accent-red stat-bubble soft-ring" opacity="0.14"/>
     <text x="0" y="8" class="text stat-number accent-red" text-anchor="middle">${totalContributions.toLocaleString()}</text>
     <text x="0" y="31" class="accent-red stat-label" text-anchor="middle">Total Contributions</text>
     <text x="0" y="50" class="text stat-detail" text-anchor="middle">${accountCreated} - Present</text>
@@ -646,7 +893,7 @@ function generateSVG(
   
   <!-- Current Streak -->
   <g transform="translate(400, 90)">
-    <circle cx="0" cy="0" r="50" class="accent-blue" opacity="0.12"/>
+    <circle cx="0" cy="0" r="52" class="accent-blue stat-bubble soft-ring" opacity="0.14"/>
     <path d="M -8 -22 Q -8 -27 -3 -27 L -3 -32 Q -3 -37 -8 -37 Q -13 -37 -13 -32 L -13 -27 Q -13 -27 -8 -22 M 8 -22 Q 8 -27 3 -27 L 3 -32 Q 3 -37 8 -37 Q 13 -37 13 -32 L 13 -27 Q 13 -27 8 -22 Z" class="accent-blue" opacity="0.7"/>
     <text x="0" y="8" class="text stat-number accent-blue" text-anchor="middle">${
       streaks.current
@@ -657,7 +904,7 @@ function generateSVG(
   
   <!-- Longest Streak -->
   <g transform="translate(660, 90)">
-    <circle cx="0" cy="0" r="50" class="accent-purple" opacity="0.12"/>
+    <circle cx="0" cy="0" r="52" class="accent-purple stat-bubble soft-ring" opacity="0.14"/>
     <text x="0" y="8" class="text stat-number accent-purple" text-anchor="middle">${
       streaks.longest
     }</text>
@@ -670,11 +917,11 @@ function generateSVG(
   <line x1="530" y1="30" x2="530" y2="150" class="border" stroke-width="2" opacity="0.3"/>
   
   <!-- Activity Graph Container -->
-  <rect x="10" y="190" width="780" height="190" class="section-bg" rx="10"/>
-  <rect x="10" y="190" width="780" height="190" fill="none" class="border" stroke-width="2" rx="10"/>
+  <rect x="10" y="190" width="780" height="190" class="section-bg soft-shadow" rx="14"/>
+  <rect x="10" y="190" width="780" height="190" fill="none" class="border" stroke-width="1.5" rx="14"/>
   
   <!-- Activity Graph Title -->
-  <text x="30" y="218" class="text section-title">Contribution Activity (Last 90 Days)</text>
+  <text x="30" y="218" class="text section-title">Contribution Activity (Last 100 Days)</text>
   
   <!-- Activity Graph -->
   <g transform="translate(30, 240)">
@@ -683,31 +930,34 @@ function generateSVG(
     
     <!-- Graph area and line -->
     <path d="${areaPath}" class="graph-area"/>
-    <path d="${linePath}" class="graph-line"/>
+    <path d="${linePath}" class="graph-line" pathLength="100"/>
     
     <!-- Axes -->
     <line x1="${padding}" y1="${graphHeight - padding}" x2="${
     graphWidth - padding
-  }" y2="${graphHeight - padding}" class="border" stroke-width="2"/>
+  }" y2="${graphHeight - padding}" class="border" stroke-width="2.5"/>
     <line x1="${padding}" y1="${padding}" x2="${padding}" y2="${
     graphHeight - padding
-  }" class="border" stroke-width="2"/>
+  }" class="border" stroke-width="2.5"/>
     
     <!-- Axis labels -->
-    <text x="${padding + 10}" y="${
-    graphHeight - 8
-  }" class="axis-label">90 days ago</text>
-    <text x="${graphWidth - padding - 10}" y="${
-    graphHeight - 8
-  }" class="axis-label" text-anchor="end">Today</text>
+    ${sundayLabels}
+  </g>
+
+  <!-- Organizations Container -->
+  <rect x="10" y="400" width="780" height="170" class="section-bg soft-shadow" rx="14"/>
+  <rect x="10" y="400" width="780" height="170" fill="none" class="border" stroke-width="1.5" rx="14"/>
+  <text x="30" y="430" class="text section-title">Organizations</text>
+  <g>
+    ${orgs.length ? orgCards : orgEmptyState}
   </g>
   
   <!-- Additional Stats Container -->
-  <rect x="10" y="400" width="780" height="90" class="section-bg" rx="10"/>
-  <rect x="10" y="400" width="780" height="90" fill="none" class="border" stroke-width="2" rx="10"/>
+  <rect x="10" y="590" width="780" height="90" class="section-bg soft-shadow" rx="14"/>
+  <rect x="10" y="590" width="780" height="90" fill="none" class="border" stroke-width="1.5" rx="14"/>
   
   <!-- Repository Stats -->
-  <g transform="translate(0, 455)">
+  <g transform="translate(0, 645)">
     <text x="200" y="0" class="text stat-number accent-blue" text-anchor="middle">${repoStats.totalStars.toLocaleString()}</text>
     <text x="200" y="22" class="accent-blue stat-label" text-anchor="middle">Total Stars</text>
     
@@ -720,24 +970,24 @@ function generateSVG(
     <text x="600" y="22" class="accent-green stat-label" text-anchor="middle">Languages Used</text>
   </g>
   
-  <line x1="310" y1="415" x2="310" y2="475" class="border" stroke-width="2" opacity="0.3"/>
-  <line x1="490" y1="415" x2="490" y2="475" class="border" stroke-width="2" opacity="0.3"/>
+  <line x1="310" y1="605" x2="310" y2="665" class="border" stroke-width="2" opacity="0.3"/>
+  <line x1="490" y1="605" x2="490" y2="665" class="border" stroke-width="2" opacity="0.3"/>
   
   <!-- Languages Container -->
-  <rect x="10" y="510" width="780" height="240" class="section-bg" rx="10"/>
-  <rect x="10" y="510" width="780" height="240" fill="none" class="border" stroke-width="2" rx="10"/>
+  <rect x="10" y="700" width="780" height="240" class="section-bg-strong soft-shadow" rx="14"/>
+  <rect x="10" y="700" width="780" height="240" fill="none" class="border" stroke-width="1.5" rx="14"/>
   
   <!-- Languages Title -->
-  <text x="30" y="538" class="accent-green section-title">Most Used Languages</text>
+  <text x="30" y="728" class="text section-title">Most Used Languages</text>
   
-  <!-- Language Bar -->
+  <!-- Language Pie Chart -->
   <g>
-    ${languageBarSegments}
+    ${pieChart}
   </g>
   
-  <!-- Language List -->
+  <!-- Language Badges -->
   <g>
-    ${languageList}
+    ${languageBadges}
   </g>
 </svg>
   `.trim();
@@ -745,15 +995,21 @@ function generateSVG(
 
 module.exports = async (req, res) => {
   try {
-    const { username } = req.query;
+    const { username, orgs } = req.query;
 
     if (!username) {
       return res.status(400).send("Username parameter is required");
     }
 
-    const { calendar, repositories, createdAt } = await fetchGitHubData(
-      username
-    );
+    const orgLogins = orgs
+      ? String(orgs)
+          .split(",")
+          .map((org) => org.trim())
+          .filter(Boolean)
+      : [];
+
+    const { calendar, repositories, createdAt, organizations } =
+      await fetchGitHubData(username, orgLogins);
     
     console.log(`=== Final Stats for ${username} ===`);
     console.log(`Total contributions in calendar: ${calendar.totalContributions}`);
@@ -761,7 +1017,7 @@ module.exports = async (req, res) => {
     console.log(`Total repositories: ${repositories.length}`);
     
     const streaks = calculateStreaks(calendar.weeks);
-    const activityDays = getLast90Days(calendar.weeks);
+    const activityDays = getLast100Days(calendar.weeks);
     
     console.log(`Activity days (last 90): ${activityDays.length}`);
     console.log(`Current streak: ${streaks.current}, Longest streak: ${streaks.longest}`);
@@ -775,7 +1031,8 @@ module.exports = async (req, res) => {
       activityDays,
       languages,
       createdAt,
-      repoStats
+      repoStats,
+      organizations
     );
 
     res.setHeader("Content-Type", "image/svg+xml");
