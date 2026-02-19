@@ -566,6 +566,43 @@ function buildShieldUrl(label, colorHex) {
   return `https://img.shields.io/badge/${encodedLabel}-${cleanColor}?style=for-the-badge`;
 }
 
+// Convert image URL to base64 data URI for embedding in SVG
+async function fetchImageAsBase64(url) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const buffer = await response.buffer();
+    const contentType = response.headers.get("content-type") || "image/png";
+    return `data:${contentType};base64,${buffer.toString("base64")}`;
+  } catch (error) {
+    console.error("Failed to fetch image:", url, error.message);
+    return null;
+  }
+}
+
+// Calculate relative luminance to determine if text should be light or dark
+function getContrastTextColor(hexColor) {
+  const hex = hexColor.replace("#", "");
+  const r = parseInt(hex.substr(0, 2), 16) / 255;
+  const g = parseInt(hex.substr(2, 2), 16) / 255;
+  const b = parseInt(hex.substr(4, 2), 16) / 255;
+  // Relative luminance formula
+  const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+  return luminance > 0.5 ? "#000000" : "#ffffff";
+}
+
+// Generate native SVG badge instead of external shields.io
+function generateSvgBadge(label, colorHex, x, y, width, height) {
+  const cleanColor = colorHex.startsWith("#") ? colorHex : `#${colorHex}`;
+  const textColor = getContrastTextColor(cleanColor);
+  const textX = x + width / 2;
+  const textY = y + height / 2 + 4;
+  return `
+    <rect x="${x}" y="${y}" width="${width}" height="${height}" rx="4" fill="${cleanColor}"/>
+    <text x="${textX}" y="${textY}" text-anchor="middle" font-size="11" font-weight="600" fill="${textColor}" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif">${label}</text>
+  `;
+}
+
 function getAccountCreationDate(createdAt) {
   const date = new Date(createdAt);
   return date.toLocaleDateString("en-US", {
@@ -722,7 +759,7 @@ function generateSVG(
     })
     .join("");
 
-  // Generate language list with external shield badges
+  // Generate language list with native SVG badges (no external images)
   const languageBadges = languages
     .map((lang, index) => {
       const row = Math.floor(index / 2);
@@ -730,13 +767,10 @@ function generateSVG(
       const x = col === 0 ? 300 : 540;
       const y = 770 + row * 46;
       const badgeHeight = 28;
-      const label = `${lang.name}-${lang.percentage}%`;
-      const badgeWidth = Math.max(150, label.length * 7);
-      const badgeUrl = buildShieldUrl(label, lang.color);
+      const label = `${lang.name} ${lang.percentage}%`;
+      const badgeWidth = Math.max(120, label.length * 8 + 20);
 
-      return `
-        <image href="${badgeUrl}" x="${x}" y="${y}" width="${badgeWidth}" height="${badgeHeight}" />
-      `;
+      return generateSvgBadge(label, lang.color, x, y, badgeWidth, badgeHeight);
     })
     .join("");
 
@@ -752,11 +786,13 @@ function generateSVG(
       const x = col === 0 ? 60 : 420;
       const y = 470 + row * 68;
       const clipId = `orgClip${index}`;
+      // Use base64 data URI if available, fallback to original URL
+      const imgSrc = org.avatarBase64 || org.avatarUrl;
       return `
         <clipPath id="${clipId}">
           <circle cx="${x + 18}" cy="${y - 10}" r="18"/>
         </clipPath>
-        <image href="${org.avatarUrl}" x="${x}" y="${y - 28}" width="36" height="36" clip-path="url(#${clipId})"/>
+        <image href="${imgSrc}" x="${x}" y="${y - 28}" width="36" height="36" clip-path="url(#${clipId})"/>
         <text x="${x + 50}" y="${y - 6}" class="text stat-label">${org.login}</text>
         <text x="${x + 50}" y="${y + 14}" class="text stat-detail">${org.contributions.toLocaleString()} contributions</text>
       `;
@@ -1011,6 +1047,14 @@ module.exports = async (req, res) => {
     const { calendar, repositories, createdAt, organizations } =
       await fetchGitHubData(username, orgLogins);
     
+    // Fetch organization avatars as base64 to embed in SVG (GitHub blocks external images)
+    const orgsWithBase64 = await Promise.all(
+      (organizations || []).map(async (org) => {
+        const avatarBase64 = await fetchImageAsBase64(org.avatarUrl);
+        return { ...org, avatarBase64 };
+      })
+    );
+    
     console.log(`=== Final Stats for ${username} ===`);
     console.log(`Total contributions in calendar: ${calendar.totalContributions}`);
     console.log(`Total weeks: ${calendar.weeks.length}`);
@@ -1032,7 +1076,7 @@ module.exports = async (req, res) => {
       languages,
       createdAt,
       repoStats,
-      organizations
+      orgsWithBase64
     );
 
     res.setHeader("Content-Type", "image/svg+xml");
